@@ -28,7 +28,7 @@ An extremely fast Python linter and code formatter, written in Rust.
 - ⚡️ 10-100x faster than existing linters (like Flake8) and formatters (like Black)
 - 🐍 Installable via `pip`
 - 🛠️ `pyproject.toml` support
-- 🤝 Python 3.12 compatibility
+- 🤝 Python 3.13 compatibility
 - ⚖️ Drop-in parity with [Flake8](https://docs.astral.sh/ruff/faq/#how-does-ruff-compare-to-flake8), isort, and Black
 - 📦 Built-in caching, to avoid re-analyzing unchanged files
 - 🔧 Fix support, for automatic error correction (e.g., automatically remove unused imports)
@@ -152,7 +152,7 @@ Ruff can also be used as a [pre-commit](https://pre-commit.com/) hook via [`ruff
 ```yaml
 - repo: https://github.com/astral-sh/ruff-pre-commit
   # Ruff version.
-  rev: v0.4.4
+  rev: v0.5.0
   hooks:
     # Run the linter.
     - id: ruff
@@ -334,7 +334,6 @@ quality tools, including:
 - [flake8-super](https://pypi.org/project/flake8-super/)
 - [flake8-tidy-imports](https://pypi.org/project/flake8-tidy-imports/)
 - [flake8-todos](https://pypi.org/project/flake8-todos/)
-- [flake8-trio](https://pypi.org/project/flake8-trio/)
 - [flake8-type-checking](https://pypi.org/project/flake8-type-checking/)
 - [flake8-use-pathlib](https://pypi.org/project/flake8-use-pathlib/)
 - [flynt](https://pypi.org/project/flynt/) ([#2102](https://github.com/astral-sh/ruff/issues/2102))
@@ -408,6 +407,7 @@ Ruff is used by a number of major open-source projects and companies, including:
 - [Dagster](https://github.com/dagster-io/dagster)
 - Databricks ([MLflow](https://github.com/mlflow/mlflow))
 - [FastAPI](https://github.com/tiangolo/fastapi)
+- [Godot](https://github.com/godotengine/godot)
 - [Gradio](https://github.com/gradio-app/gradio)
 - [Great Expectations](https://github.com/great-expectations/great_expectations)
 - [HTTPX](https://github.com/encode/httpx)
@@ -433,6 +433,7 @@ Ruff is used by a number of major open-source projects and companies, including:
 - Modern Treasury ([Python SDK](https://github.com/Modern-Treasury/modern-treasury-python))
 - Mozilla ([Firefox](https://github.com/mozilla/gecko-dev))
 - [Mypy](https://github.com/python/mypy)
+- [Nautobot](https://github.com/nautobot/nautobot)
 - Netflix ([Dispatch](https://github.com/Netflix/dispatch))
 - [Neon](https://github.com/neondatabase/neon)
 - [Nokia](https://nokia.com/)
@@ -440,6 +441,7 @@ Ruff is used by a number of major open-source projects and companies, including:
 - [NumPyro](https://github.com/pyro-ppl/numpyro)
 - [ONNX](https://github.com/onnx/onnx)
 - [OpenBB](https://github.com/OpenBB-finance/OpenBBTerminal)
+- [Open Wine Components](https://github.com/Open-Wine-Components/umu-launcher)
 - [PDM](https://github.com/pdm-project/pdm)
 - [PaddlePaddle](https://github.com/PaddlePaddle/Paddle)
 - [Pandas](https://github.com/pandas-dev/pandas)
@@ -467,6 +469,7 @@ Ruff is used by a number of major open-source projects and companies, including:
 - [Sphinx](https://github.com/sphinx-doc/sphinx)
 - [Stable Baselines3](https://github.com/DLR-RM/stable-baselines3)
 - [Starlette](https://github.com/encode/starlette)
+- [Streamlit](https://github.com/streamlit/streamlit)
 - [The Algorithms](https://github.com/TheAlgorithms/Python)
 - [Vega-Altair](https://github.com/altair-viz/altair)
 - WordPress ([Openverse](https://github.com/WordPress/openverse))

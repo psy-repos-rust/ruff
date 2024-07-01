@@ -6,7 +6,7 @@ use crate::files::FileId;
 use crate::lint::{lint_semantic, lint_syntax, Diagnostics};
 use crate::module::{file_to_module, resolve_module};
 use crate::program::Program;
-use crate::symbols::{symbol_table, Dependency};
+use crate::semantic::{semantic_index, Dependency};
 
 impl Program {
     /// Checks all open files in the workspace and its dependencies.
@@ -28,8 +28,8 @@ impl Program {
     fn check_file(&self, file: FileId, context: &CheckFileContext) -> QueryResult<Diagnostics> {
         self.cancelled()?;
 
-        let symbol_table = symbol_table(self, file)?;
-        let dependencies = symbol_table.dependencies();
+        let index = semantic_index(self, file)?;
+        let dependencies = index.symbol_table().dependencies();
 
         if !dependencies.is_empty() {
             let module = file_to_module(self, file)?;
@@ -51,7 +51,7 @@ impl Program {
                     // TODO We may want to have a different check functions for non-first-party
                     //   files because we only need to index them and not check them.
                     //   Supporting non-first-party code also requires supporting typing stubs.
-                    if let Some(dependency) = resolve_module(self, dependency_name)? {
+                    if let Some(dependency) = resolve_module(self, &dependency_name)? {
                         if dependency.path(self)?.root().kind().is_first_party() {
                             context.schedule_dependency(dependency.path(self)?.file());
                         }

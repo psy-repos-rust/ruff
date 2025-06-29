@@ -18,7 +18,6 @@ use clap::{CommandFactory, Parser};
 use colored::Colorize;
 use crossbeam::channel as crossbeam_channel;
 use rayon::ThreadPoolBuilder;
-use ruff_db::Upcast;
 use ruff_db::diagnostic::{Diagnostic, DisplayDiagnosticConfig, Severity};
 use ruff_db::max_parallelism;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
@@ -143,6 +142,14 @@ fn run_check(args: CheckCommand) -> anyhow::Result<ExitStatus> {
     } else {
         main_loop.run(&mut db)?
     };
+
+    let mut stdout = stdout().lock();
+    match std::env::var("TY_MEMORY_REPORT").as_deref() {
+        Ok("short") => write!(stdout, "{}", db.salsa_memory_dump().display_short())?,
+        Ok("mypy_primer") => write!(stdout, "{}", db.salsa_memory_dump().display_mypy_primer())?,
+        Ok("full") => write!(stdout, "{}", db.salsa_memory_dump().display_full())?,
+        _ => {}
+    }
 
     tracing::trace!("Counts for entire CLI run:\n{}", countme::get_all());
 
@@ -302,11 +309,7 @@ impl MainLoop {
                             let diagnostics_count = result.len();
 
                             for diagnostic in result {
-                                write!(
-                                    stdout,
-                                    "{}",
-                                    diagnostic.display(&db.upcast(), &display_config)
-                                )?;
+                                write!(stdout, "{}", diagnostic.display(db, &display_config))?;
 
                                 max_severity = max_severity.max(diagnostic.severity());
                             }

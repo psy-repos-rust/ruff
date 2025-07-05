@@ -179,7 +179,7 @@ class PlaygroundServer
       monaco.languages.registerDocumentFormattingEditProvider("python", this);
   }
 
-  triggerCharacters: undefined;
+  triggerCharacters: string[] = ["."];
 
   provideCompletionItems(
     model: editor.ITextModel,
@@ -202,11 +202,15 @@ class PlaygroundServer
       new TyPosition(position.lineNumber, position.column),
     );
 
+    // If completions is 100, this gives us "99" which has a length of two
+    const digitsLength = String(completions.length - 1).length;
+
     return {
-      suggestions: completions.map((completion) => ({
-        label: completion.label,
+      suggestions: completions.map((completion, i) => ({
+        label: completion.name,
+        sortText: String(i).padStart(digitsLength, "0"),
         kind: CompletionItemKind.Variable,
-        insertText: completion.label,
+        insertText: completion.name,
         // TODO(micha): It's unclear why this field is required for monaco but not VS Code.
         //  and omitting it works just fine? The LSP doesn't expose this information right now
         //  which is why we go with undefined for now.
@@ -491,7 +495,7 @@ class PlaygroundServer
     this.typeDefinitionProviderDisposable.dispose();
     this.inlayHintsDisposable.dispose();
     this.formatDisposable.dispose();
-    this.editorOpenerDisposable.dispose();
+    this.completionDisposable.dispose();
   }
 }
 

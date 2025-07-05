@@ -8,19 +8,21 @@
 //! reasonably ask us to type-check code assuming that the code runs
 //! on Linux.)
 
-use std::fmt::Display;
 use std::io;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::str::FromStr;
 use std::{fmt, sync::Arc};
 
+use crate::{PythonVersionFileSource, PythonVersionSource, PythonVersionWithSource};
+use camino::Utf8Component;
 use indexmap::IndexSet;
+use ruff_annotate_snippets::{Level, Renderer, Snippet};
 use ruff_db::system::{System, SystemPath, SystemPathBuf};
 use ruff_python_ast::PythonVersion;
 use ruff_python_trivia::Cursor;
+use ruff_source_file::{LineIndex, OneIndexed, SourceCode};
 use ruff_text_size::{TextLen, TextRange};
-
-use crate::{PythonVersionFileSource, PythonVersionSource, PythonVersionWithSource};
 
 type SitePackagesDiscoveryResult<T> = Result<T, SitePackagesDiscoveryError>;
 
@@ -42,13 +44,9 @@ type SitePackagesDiscoveryResult<T> = Result<T, SitePackagesDiscoveryError>;
 /// *might* be added to the `SitePackagesPaths` twice, but we wouldn't
 /// want duplicates to appear in this set.
 #[derive(Debug, PartialEq, Eq, Default)]
-pub(crate) struct SitePackagesPaths(IndexSet<SystemPathBuf>);
+pub struct SitePackagesPaths(IndexSet<SystemPathBuf>);
 
 impl SitePackagesPaths {
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
     fn single(path: SystemPathBuf) -> Self {
         Self(IndexSet::from([path]))
     }
@@ -59,6 +57,54 @@ impl SitePackagesPaths {
 
     fn extend(&mut self, other: Self) {
         self.0.extend(other.0);
+    }
+
+    /// Tries to detect the version from the layout of the `site-packages` directory.
+    pub fn python_version_from_layout(&self) -> Option<PythonVersionWithSource> {
+        if cfg!(windows) {
+            // The path to `site-packages` on Unix is
+            // `<sys.prefix>/lib/pythonX.Y/site-packages`,
+            // but on Windows it's `<sys.prefix>/Lib/site-packages`.
+            return None;
+        }
+
+        let primary_site_packages = self.0.first()?;
+
+        let mut site_packages_ancestor_components =
+            primary_site_packages.components().rev().skip(1).map(|c| {
+                // This should have all been validated in `site_packages.rs`
+                // when we resolved the search paths for the project.
+                debug_assert!(
+                    matches!(c, Utf8Component::Normal(_)),
+                    "Unexpected component in site-packages path `{c:?}` \
+                    (expected `site-packages` to be an absolute path with symlinks resolved, \
+                    located at `<sys.prefix>/lib/pythonX.Y/site-packages`)"
+                );
+
+                c.as_str()
+            });
+
+        let parent_component = site_packages_ancestor_components.next()?;
+
+        if site_packages_ancestor_components.next()? != "lib" {
+            return None;
+        }
+
+        let version = parent_component
+            .strip_prefix("python")
+            .or_else(|| parent_component.strip_prefix("pypy"))?
+            .trim_end_matches('t');
+
+        let version = PythonVersion::from_str(version).ok()?;
+        let source = PythonVersionSource::InstallationDirectoryLayout {
+            site_packages_parent_dir: Box::from(parent_component),
+        };
+
+        Some(PythonVersionWithSource { version, source })
+    }
+
+    pub fn into_vec(self) -> Vec<SystemPathBuf> {
+        self.0.into_iter().collect()
     }
 }
 
@@ -84,13 +130,67 @@ impl PartialEq<&[SystemPathBuf]> for SitePackagesPaths {
 }
 
 #[derive(Debug)]
-pub(crate) enum PythonEnvironment {
+pub enum PythonEnvironment {
     Virtual(VirtualEnvironment),
     System(SystemEnvironment),
 }
 
 impl PythonEnvironment {
-    pub(crate) fn new(
+    pub fn discover(
+        project_root: &SystemPath,
+        system: &dyn System,
+    ) -> Result<Option<Self>, SitePackagesDiscoveryError> {
+        fn resolve_environment(
+            system: &dyn System,
+            path: &SystemPath,
+            origin: SysPrefixPathOrigin,
+        ) -> Result<PythonEnvironment, SitePackagesDiscoveryError> {
+            tracing::debug!("Resolving {origin}: {path}");
+            PythonEnvironment::new(path, origin, system)
+        }
+
+        if let Ok(virtual_env) = system.env_var("VIRTUAL_ENV") {
+            return resolve_environment(
+                system,
+                SystemPath::new(&virtual_env),
+                SysPrefixPathOrigin::VirtualEnvVar,
+            )
+            .map(Some);
+        }
+
+        if let Ok(conda_env) = system.env_var("CONDA_PREFIX") {
+            return resolve_environment(
+                system,
+                SystemPath::new(&conda_env),
+                SysPrefixPathOrigin::CondaPrefixVar,
+            )
+            .map(Some);
+        }
+
+        tracing::debug!("Discovering virtual environment in `{project_root}`");
+        let virtual_env_directory = project_root.join(".venv");
+
+        match PythonEnvironment::new(
+            &virtual_env_directory,
+            SysPrefixPathOrigin::LocalVenv,
+            system,
+        ) {
+            Ok(environment) => return Ok(Some(environment)),
+            Err(err) => {
+                if system.is_directory(&virtual_env_directory) {
+                    tracing::debug!(
+                        "Ignoring automatically detected virtual environment at `{}`: {}",
+                        &virtual_env_directory,
+                        err
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn new(
         path: impl AsRef<SystemPath>,
         origin: SysPrefixPathOrigin,
         system: &dyn System,
@@ -102,7 +202,7 @@ impl PythonEnvironment {
             Ok(venv) => Ok(Self::Virtual(venv)),
             // If there's not a `pyvenv.cfg` marker, attempt to inspect as a system environment
             Err(SitePackagesDiscoveryError::NoPyvenvCfgFile(path, _))
-                if !origin.must_be_virtual_env() =>
+                if !path.origin.must_be_virtual_env() =>
             {
                 Ok(Self::System(SystemEnvironment::new(path)))
             }
@@ -110,23 +210,17 @@ impl PythonEnvironment {
         }
     }
 
-    /// Returns the `site-packages` directories for this Python environment,
-    /// as well as the Python version that was used to create this environment
-    /// (the latter will only be available for virtual environments that specify
+    /// Returns the Python version that was used to create this environment
+    /// (will only be available for virtual environments that specify
     /// the metadata in their `pyvenv.cfg` files).
-    ///
-    /// See the documentation for [`site_packages_directory_from_sys_prefix`] for more details.
-    pub(crate) fn into_settings(
-        self,
-        system: &dyn System,
-    ) -> SitePackagesDiscoveryResult<(SitePackagesPaths, Option<PythonVersionWithSource>)> {
-        Ok(match self {
-            Self::Virtual(venv) => (venv.site_packages_directories(system)?, venv.version),
-            Self::System(env) => (env.site_packages_directories(system)?, None),
-        })
+    pub fn python_version_from_metadata(&self) -> Option<&PythonVersionWithSource> {
+        match self {
+            Self::Virtual(venv) => venv.version.as_ref(),
+            Self::System(_) => None,
+        }
     }
 
-    fn site_packages_directories(
+    pub fn site_packages_paths(
         &self,
         system: &dyn System,
     ) -> SitePackagesDiscoveryResult<SitePackagesPaths> {
@@ -172,7 +266,7 @@ impl PythonImplementation {
 /// The format of this file is not defined anywhere, and exactly which keys are present
 /// depends on the tool that was used to create the virtual environment.
 #[derive(Debug)]
-pub(crate) struct VirtualEnvironment {
+pub struct VirtualEnvironment {
     root_path: SysPrefixPath,
     base_executable_home_path: PythonHomePath,
     include_system_site_packages: bool,
@@ -321,7 +415,7 @@ impl VirtualEnvironment {
         );
 
         if let Some(parent_env_site_packages) = parent_environment.as_deref() {
-            match parent_env_site_packages.site_packages_directories(system) {
+            match parent_env_site_packages.site_packages_paths(system) {
                 Ok(parent_environment_site_packages) => {
                     site_packages_directories.extend(parent_environment_site_packages);
                 }
@@ -491,7 +585,7 @@ struct RawPyvenvCfg<'s> {
 /// This environment may or may not be one that is managed by the operating system itself, e.g.,
 /// this captures both Homebrew-installed Python versions and the bundled macOS Python installation.
 #[derive(Debug)]
-pub(crate) struct SystemEnvironment {
+pub struct SystemEnvironment {
     root_path: SysPrefixPath,
 }
 
@@ -530,25 +624,21 @@ impl SystemEnvironment {
 }
 
 /// Enumeration of ways in which `site-packages` discovery can fail.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SitePackagesDiscoveryError {
+#[derive(Debug)]
+pub enum SitePackagesDiscoveryError {
     /// `site-packages` discovery failed because the provided path couldn't be canonicalized.
-    #[error("Invalid {1}: `{0}` could not be canonicalized")]
-    CanonicalizationError(SystemPathBuf, SysPrefixPathOrigin, #[source] io::Error),
+    CanonicalizationError(SystemPathBuf, SysPrefixPathOrigin, io::Error),
 
-    /// `site-packages` discovery failed because the [`SysPrefixPathOrigin`] indicated that
-    /// the provided path should point to `sys.prefix` directly, but the path wasn't a directory.
-    #[error("Invalid {1}: `{0}` does not point to a directory on disk")]
-    SysPrefixNotADirectory(SystemPathBuf, SysPrefixPathOrigin),
+    /// `site-packages` discovery failed because the provided path doesn't appear to point to
+    /// a Python executable or a `sys.prefix` directory.
+    PathNotExecutableOrDirectory(SystemPathBuf, SysPrefixPathOrigin, Option<io::Error>),
 
     /// `site-packages` discovery failed because the [`SysPrefixPathOrigin`] indicated that
     /// the provided path should point to the `sys.prefix` of a virtual environment,
     /// but there was no file at `<sys.prefix>/pyvenv.cfg`.
-    #[error("{} points to a broken venv with no pyvenv.cfg file", .0.origin)]
-    NoPyvenvCfgFile(SysPrefixPath, #[source] io::Error),
+    NoPyvenvCfgFile(SysPrefixPath, io::Error),
 
     /// `site-packages` discovery failed because the `pyvenv.cfg` file could not be parsed.
-    #[error("Failed to parse the pyvenv.cfg file at {0} because {1}")]
     PyvenvCfgParseError(SystemPathBuf, PyvenvCfgParseErrorKind),
 
     /// `site-packages` discovery failed because we're on a Unix system,
@@ -556,20 +646,152 @@ pub(crate) enum SitePackagesDiscoveryError {
     /// would be relative to the `sys.prefix` path, and we tried to fallback to iterating
     /// through the `<sys.prefix>/lib` directory looking for a `site-packages` directory,
     /// but we came across some I/O error while trying to do so.
-    #[error(
-        "Failed to iterate over the contents of the `lib` directory of the Python installation at {1}"
-    )]
-    CouldNotReadLibDirectory(#[source] io::Error, SysPrefixPath),
+    CouldNotReadLibDirectory(SysPrefixPath, io::Error),
 
     /// We looked everywhere we could think of for the `site-packages` directory,
     /// but none could be found despite our best endeavours.
-    #[error("Could not find the `site-packages` directory for the Python installation at {0}")]
     NoSitePackagesDirFound(SysPrefixPath),
+}
+
+impl std::error::Error for SitePackagesDiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CanonicalizationError(_, _, io_err) => Some(io_err),
+            Self::PathNotExecutableOrDirectory(_, _, io_err) => {
+                io_err.as_ref().map(|e| e as &dyn std::error::Error)
+            }
+            Self::NoPyvenvCfgFile(_, io_err) => Some(io_err),
+            Self::PyvenvCfgParseError(_, _) => None,
+            Self::CouldNotReadLibDirectory(_, io_err) => Some(io_err),
+            Self::NoSitePackagesDirFound(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SitePackagesDiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CanonicalizationError(given_path, origin, _) => {
+                display_error(f, origin, given_path, "Failed to canonicalize", None)
+            }
+            Self::PathNotExecutableOrDirectory(path, origin, _) => {
+                let thing = if origin.must_point_directly_to_sys_prefix() {
+                    "directory on disk"
+                } else {
+                    "Python executable or a directory on disk"
+                };
+                display_error(
+                    f,
+                    origin,
+                    path,
+                    &format!("Invalid {origin}"),
+                    Some(&format!("does not point to a {thing}")),
+                )
+            }
+            Self::NoPyvenvCfgFile(SysPrefixPath { inner, origin }, _) => display_error(
+                f,
+                origin,
+                inner,
+                &format!("Invalid {origin}"),
+                Some("points to a broken venv with no pyvenv.cfg file"),
+            ),
+            Self::PyvenvCfgParseError(path, kind) => {
+                write!(
+                    f,
+                    "Failed to parse the `pyvenv.cfg` file at `{path}` because {kind}"
+                )
+            }
+            Self::CouldNotReadLibDirectory(SysPrefixPath { inner, origin }, _) => display_error(
+                f,
+                origin,
+                inner,
+                "Failed to iterate over the contents of the `lib` directory of the Python installation",
+                None,
+            ),
+            Self::NoSitePackagesDirFound(SysPrefixPath { inner, origin }) => display_error(
+                f,
+                origin,
+                inner,
+                &format!("Invalid {origin}"),
+                Some(
+                    "Could not find a `site-packages` directory for this Python installation/executable",
+                ),
+            ),
+        }
+    }
+}
+
+fn display_error(
+    f: &mut std::fmt::Formatter<'_>,
+    sys_prefix_origin: &SysPrefixPathOrigin,
+    given_path: &SystemPath,
+    primary_message: &str,
+    secondary_message: Option<&str>,
+) -> std::fmt::Result {
+    let fallback: &mut dyn FnMut() -> std::fmt::Result = &mut || {
+        f.write_str(primary_message)?;
+        write!(f, " `{given_path}`")?;
+        if let Some(secondary_message) = secondary_message {
+            f.write_str(": ")?;
+            f.write_str(secondary_message)?;
+        }
+        Ok(())
+    };
+
+    let SysPrefixPathOrigin::ConfigFileSetting(config_file_path, Some(setting_range)) =
+        sys_prefix_origin
+    else {
+        return fallback();
+    };
+
+    let Ok(config_file_source) = std::fs::read_to_string((**config_file_path).as_ref()) else {
+        return fallback();
+    };
+
+    let index = LineIndex::from_source_text(&config_file_source);
+    let source = SourceCode::new(&config_file_source, &index);
+
+    let primary_message = format!(
+        "{primary_message}
+
+--> Invalid setting in configuration file `{config_file_path}`"
+    );
+
+    let start_index = source.line_index(setting_range.start()).saturating_sub(2);
+    let end_index = source
+        .line_index(setting_range.end())
+        .saturating_add(2)
+        .min(OneIndexed::from_zero_indexed(source.line_count()));
+
+    let start_offset = source.line_start(start_index);
+    let end_offset = source.line_end(end_index);
+
+    let mut annotation = Level::Error.span((setting_range - start_offset).into());
+
+    if let Some(secondary_message) = secondary_message {
+        annotation = annotation.label(secondary_message);
+    }
+
+    let snippet = Snippet::source(&config_file_source[TextRange::new(start_offset, end_offset)])
+        .annotation(annotation)
+        .line_start(start_index.get())
+        .fold(false);
+
+    let message = Level::None.title(&primary_message).snippet(snippet);
+
+    let renderer = if colored::control::SHOULD_COLORIZE.should_colorize() {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    };
+    let renderer = renderer.cut_indicator("…");
+
+    writeln!(f, "{}", renderer.render(message))
 }
 
 /// The various ways in which parsing a `pyvenv.cfg` file could fail
 #[derive(Debug)]
-pub(crate) enum PyvenvCfgParseErrorKind {
+pub enum PyvenvCfgParseErrorKind {
     MalformedKeyValuePair { line_number: NonZeroUsize },
     NoHomeKey,
     InvalidHomeValue(io::Error),
@@ -607,7 +829,10 @@ fn site_packages_directory_from_sys_prefix(
     implementation: PythonImplementation,
     system: &dyn System,
 ) -> SitePackagesDiscoveryResult<SystemPathBuf> {
-    tracing::debug!("Searching for site-packages directory in {sys_prefix_path}");
+    tracing::debug!(
+        "Searching for site-packages directory in sys.prefix {}",
+        sys_prefix_path.inner
+    );
 
     if cfg!(target_os = "windows") {
         let site_packages = sys_prefix_path.join(r"Lib\site-packages");
@@ -676,7 +901,7 @@ fn site_packages_directory_from_sys_prefix(
     for entry_result in system
         .read_directory(&sys_prefix_path.join("lib"))
         .map_err(|io_err| {
-            SitePackagesDiscoveryError::CouldNotReadLibDirectory(io_err, sys_prefix_path.to_owned())
+            SitePackagesDiscoveryError::CouldNotReadLibDirectory(sys_prefix_path.to_owned(), io_err)
         })?
     {
         let Ok(entry) = entry_result else {
@@ -721,7 +946,7 @@ fn site_packages_directory_from_sys_prefix(
 ///
 /// [`sys.prefix`]: https://docs.python.org/3/library/sys.html#sys.prefix
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) struct SysPrefixPath {
+pub struct SysPrefixPath {
     inner: SystemPathBuf,
     origin: SysPrefixPathOrigin,
 }
@@ -732,32 +957,80 @@ impl SysPrefixPath {
         origin: SysPrefixPathOrigin,
         system: &dyn System,
     ) -> SitePackagesDiscoveryResult<Self> {
+        let sys_prefix = if !origin.must_point_directly_to_sys_prefix()
+            && system.is_file(unvalidated_path)
+            && unvalidated_path
+                .file_name()
+                .is_some_and(|name| name.starts_with("python"))
+        {
+            // It looks like they passed us a path to a Python executable, e.g. `.venv/bin/python3`.
+            // Try to figure out the `sys.prefix` value from the Python executable.
+            let sys_prefix = if cfg!(windows) {
+                // On Windows, the relative path to the Python executable from `sys.prefix`
+                // is different depending on whether it's a virtual environment or a system installation.
+                // System installations have their executable at `<sys.prefix>/python.exe`,
+                // whereas virtual environments have their executable at `<sys.prefix>/Scripts/python.exe`.
+                unvalidated_path.parent().and_then(|parent| {
+                    if parent.file_name() == Some("Scripts") {
+                        parent.parent()
+                    } else {
+                        Some(parent)
+                    }
+                })
+            } else {
+                // On Unix, `sys.prefix` is always the grandparent directory of the Python executable,
+                // regardless of whether it's a virtual environment or a system installation.
+                unvalidated_path.ancestors().nth(2)
+            };
+            let Some(sys_prefix) = sys_prefix else {
+                return Err(SitePackagesDiscoveryError::PathNotExecutableOrDirectory(
+                    unvalidated_path.to_path_buf(),
+                    origin,
+                    None,
+                ));
+            };
+            sys_prefix
+        } else {
+            unvalidated_path
+        };
+
         // It's important to resolve symlinks here rather than simply making the path absolute,
         // since system Python installations often only put symlinks in the "expected"
         // locations for `home` and `site-packages`
-        let canonicalized = system
-            .canonicalize_path(unvalidated_path)
-            .map_err(|io_err| {
-                SitePackagesDiscoveryError::CanonicalizationError(
-                    unvalidated_path.to_path_buf(),
-                    origin,
-                    io_err,
-                )
-            })?;
-        system
-            .is_directory(&canonicalized)
-            .then_some(Self {
-                inner: canonicalized,
-                origin,
-            })
-            .ok_or_else(|| {
-                SitePackagesDiscoveryError::SysPrefixNotADirectory(
-                    unvalidated_path.to_path_buf(),
-                    origin,
-                )
-            })
-    }
+        let sys_prefix = match system.canonicalize_path(sys_prefix) {
+            Ok(path) => path,
+            Err(io_err) => {
+                let unvalidated_path = unvalidated_path.to_path_buf();
+                let err = if io_err.kind() == io::ErrorKind::NotFound {
+                    SitePackagesDiscoveryError::PathNotExecutableOrDirectory(
+                        unvalidated_path,
+                        origin,
+                        Some(io_err),
+                    )
+                } else {
+                    SitePackagesDiscoveryError::CanonicalizationError(
+                        unvalidated_path,
+                        origin,
+                        io_err,
+                    )
+                };
+                return Err(err);
+            }
+        };
 
+        if !system.is_directory(&sys_prefix) {
+            return Err(SitePackagesDiscoveryError::PathNotExecutableOrDirectory(
+                unvalidated_path.to_path_buf(),
+                origin,
+                None,
+            ));
+        }
+
+        Ok(Self {
+            inner: sys_prefix,
+            origin,
+        })
+    }
     fn from_executable_home_path(path: &PythonHomePath) -> Option<Self> {
         // No need to check whether `path.parent()` is a directory:
         // the parent of a canonicalised path that is known to exist
@@ -784,16 +1057,11 @@ impl Deref for SysPrefixPath {
     }
 }
 
-impl fmt::Display for SysPrefixPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "`sys.prefix` path `{}`", self.inner)
-    }
-}
-
 /// Enumeration of sources a `sys.prefix` path can come from.
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SysPrefixPathOrigin {
+    /// The `sys.prefix` path came from a configuration file setting: `pyproject.toml` or `ty.toml`
+    ConfigFileSetting(Arc<SystemPathBuf>, Option<TextRange>),
     /// The `sys.prefix` path came from a `--python` CLI flag
     PythonCliFlag,
     /// The `sys.prefix` path came from the `VIRTUAL_ENV` environment variable
@@ -812,18 +1080,36 @@ pub enum SysPrefixPathOrigin {
 impl SysPrefixPathOrigin {
     /// Whether the given `sys.prefix` path must be a virtual environment (rather than a system
     /// Python environment).
-    pub(crate) fn must_be_virtual_env(self) -> bool {
+    pub(crate) const fn must_be_virtual_env(&self) -> bool {
         match self {
             Self::LocalVenv | Self::VirtualEnvVar => true,
-            Self::PythonCliFlag | Self::DerivedFromPyvenvCfg | Self::CondaPrefixVar => false,
+            Self::ConfigFileSetting(..)
+            | Self::PythonCliFlag
+            | Self::DerivedFromPyvenvCfg
+            | Self::CondaPrefixVar => false,
+        }
+    }
+
+    /// Whether paths with this origin always point directly to the `sys.prefix` directory.
+    ///
+    /// Some variants can point either directly to `sys.prefix` or to a Python executable inside
+    /// the `sys.prefix` directory, e.g. the `--python` CLI flag.
+    pub(crate) const fn must_point_directly_to_sys_prefix(&self) -> bool {
+        match self {
+            Self::PythonCliFlag | Self::ConfigFileSetting(..) => false,
+            Self::VirtualEnvVar
+            | Self::CondaPrefixVar
+            | Self::DerivedFromPyvenvCfg
+            | Self::LocalVenv => true,
         }
     }
 }
 
-impl Display for SysPrefixPathOrigin {
+impl std::fmt::Display for SysPrefixPathOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::PythonCliFlag => f.write_str("`--python` argument"),
+            Self::ConfigFileSetting(_, _) => f.write_str("`environment.python` setting"),
             Self::VirtualEnvVar => f.write_str("`VIRTUAL_ENV` environment variable"),
             Self::CondaPrefixVar => f.write_str("`CONDA_PREFIX` environment variable"),
             Self::DerivedFromPyvenvCfg => f.write_str("derived `sys.prefix` path"),
@@ -1030,7 +1316,7 @@ mod tests {
         #[track_caller]
         fn run(self) -> PythonEnvironment {
             let env_path = self.build();
-            let env = PythonEnvironment::new(env_path.clone(), self.origin, &self.system)
+            let env = PythonEnvironment::new(env_path.clone(), self.origin.clone(), &self.system)
                 .expect("Expected environment construction to succeed");
 
             let expect_virtual_env = self.virtual_env.is_some();
@@ -1067,7 +1353,7 @@ mod tests {
                 venv.root_path,
                 SysPrefixPath {
                     inner: self.system.canonicalize_path(expected_env_path).unwrap(),
-                    origin: self.origin,
+                    origin: self.origin.clone(),
                 }
             );
             assert_eq!(
@@ -1139,7 +1425,7 @@ mod tests {
                 env.root_path,
                 SysPrefixPath {
                     inner: self.system.canonicalize_path(expected_env_path).unwrap(),
-                    origin: self.origin,
+                    origin: self.origin.clone(),
                 }
             );
 
@@ -1378,7 +1664,7 @@ mod tests {
         let system = TestSystem::default();
         assert!(matches!(
             PythonEnvironment::new("/env", SysPrefixPathOrigin::PythonCliFlag, &system),
-            Err(SitePackagesDiscoveryError::CanonicalizationError(..))
+            Err(SitePackagesDiscoveryError::PathNotExecutableOrDirectory(..))
         ));
     }
 
@@ -1391,7 +1677,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             PythonEnvironment::new("/env", SysPrefixPathOrigin::PythonCliFlag, &system),
-            Err(SitePackagesDiscoveryError::SysPrefixNotADirectory(..))
+            Err(SitePackagesDiscoveryError::PathNotExecutableOrDirectory(..))
         ));
     }
 
@@ -1406,7 +1692,7 @@ mod tests {
         // directory
         let env =
             PythonEnvironment::new("/env", SysPrefixPathOrigin::PythonCliFlag, &system).unwrap();
-        let site_packages = env.site_packages_directories(&system);
+        let site_packages = env.site_packages_paths(&system);
         if cfg!(unix) {
             assert!(
                 matches!(
@@ -1445,7 +1731,7 @@ mod tests {
         // Environment creation succeeds, but site-packages retrieval fails
         let env =
             PythonEnvironment::new("/env", SysPrefixPathOrigin::PythonCliFlag, &system).unwrap();
-        let site_packages = env.site_packages_directories(&system);
+        let site_packages = env.site_packages_paths(&system);
         assert!(
             matches!(
                 site_packages,

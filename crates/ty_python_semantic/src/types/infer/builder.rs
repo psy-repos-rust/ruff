@@ -118,6 +118,7 @@ use crate::types::generics::{
     GenericContext, InferableTypeVars, SpecializationBuilder, bind_typevar,
     enclosing_generic_contexts, typing_self,
 };
+use crate::types::infer::builder::paramspec_validation::validate_paramspec_components;
 use crate::types::infer::{nearest_enclosing_class, nearest_enclosing_function};
 use crate::types::mro::{DynamicMroErrorKind, StaticMroErrorKind};
 use crate::types::newtype::NewType;
@@ -149,6 +150,7 @@ use crate::unpack::{EvaluationMode, UnpackPosition};
 use crate::{AnalysisSettings, Db, FxIndexSet, FxOrderSet, Program};
 
 mod annotation_expression;
+mod paramspec_validation;
 mod type_expression;
 
 /// Whether the intersection type is on the left or right side of the comparison.
@@ -3176,6 +3178,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for parameter in &function.parameters {
             self.infer_definition(parameter);
         }
+
+        validate_paramspec_components(&self.context, &function.parameters, |expr| {
+            self.file_expression_type(expr)
+        });
+
         self.infer_body(&function.body);
 
         if let Some(returns) = function.returns.as_deref() {
@@ -3668,6 +3675,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let default_expr = default.as_ref();
         if let Some(annotation) = parameter.annotation.as_ref() {
             let declared_ty = self.file_expression_type(annotation);
+
+            // P.args and P.kwargs are only valid as annotations on *args and **kwargs,
+            // not on regular parameters.
+            if let Type::TypeVar(typevar) = declared_ty
+                && typevar.is_paramspec(self.db())
+                && let Some(attr) = typevar.paramspec_attr(self.db())
+            {
+                let name = typevar.name(self.db());
+                let (attr_name, variadic) = match attr {
+                    ParamSpecAttrKind::Args => ("args", "*args"),
+                    ParamSpecAttrKind::Kwargs => ("kwargs", "**kwargs"),
+                };
+                if let Some(builder) = self
+                    .context
+                    .report_lint(&INVALID_PARAMSPEC, annotation.as_ref())
+                {
+                    builder.into_diagnostic(format_args!(
+                        "`{name}.{attr_name}` is only valid for annotating `{variadic}`",
+                    ));
+                }
+            }
+
             if let Some(default_expr) = default_expr {
                 let default_expr = default_expr.as_ref();
                 let default_ty = self.file_expression_type(default_expr);
@@ -9224,6 +9253,49 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
 
+            // P.args and P.kwargs are only valid as annotations on *args and **kwargs.
+            if let Type::TypeVar(typevar) = annotated.inner_type()
+                && typevar.is_paramspec(self.db())
+                && let Some(attr) = typevar.paramspec_attr(self.db())
+            {
+                let name = typevar.name(self.db());
+                let (attr_name, variadic) = match attr {
+                    ParamSpecAttrKind::Args => ("args", "*args"),
+                    ParamSpecAttrKind::Kwargs => ("kwargs", "**kwargs"),
+                };
+                if let Some(builder) = self
+                    .context
+                    .report_lint(&INVALID_PARAMSPEC, annotation.as_ref())
+                {
+                    builder.into_diagnostic(format_args!(
+                        "`{name}.{attr_name}` is only valid for annotating `{variadic}` function parameters",
+                    ));
+                }
+            } else if let ast::Expr::Attribute(attr_expr) = annotation.as_ref()
+                && matches!(attr_expr.attr.as_str(), "args" | "kwargs")
+            {
+                let value_ty = self.expression_type(&attr_expr.value);
+                if let Type::KnownInstance(KnownInstanceType::TypeVar(typevar)) = value_ty
+                    && typevar.is_paramspec(self.db())
+                {
+                    let name = typevar.name(self.db());
+                    let attr_name = &attr_expr.attr;
+                    let variadic = if attr_name == "args" {
+                        "*args"
+                    } else {
+                        "**kwargs"
+                    };
+                    if let Some(builder) = self
+                        .context
+                        .report_lint(&INVALID_PARAMSPEC, annotation.as_ref())
+                    {
+                        builder.into_diagnostic(format_args!(
+                            "`{name}.{attr_name}` is only valid for annotating `{variadic}` function parameters",
+                        ));
+                    }
+                }
+            }
+
             let value_ty = value.as_ref().map(|value| {
                 self.infer_maybe_standalone_expression(
                     value,
@@ -9367,6 +9439,46 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             annotation,
             DeferredExpressionState::from(self.defer_annotations()),
         );
+
+        // P.args and P.kwargs are only valid as annotations on *args and **kwargs,
+        // not as variable annotations. Check both resolved type and AST form.
+        if let Type::TypeVar(typevar) = declared.inner_type()
+            && typevar.is_paramspec(self.db())
+            && let Some(attr) = typevar.paramspec_attr(self.db())
+        {
+            let name = typevar.name(self.db());
+            let (attr_name, variadic) = match attr {
+                ParamSpecAttrKind::Args => ("args", "*args"),
+                ParamSpecAttrKind::Kwargs => ("kwargs", "**kwargs"),
+            };
+            if let Some(builder) = self.context.report_lint(&INVALID_PARAMSPEC, annotation) {
+                builder.into_diagnostic(format_args!(
+                    "`{name}.{attr_name}` is only valid for annotating `{variadic}` function parameters",
+                ));
+            }
+        } else if let ast::Expr::Attribute(attr_expr) = annotation
+            && matches!(attr_expr.attr.as_str(), "args" | "kwargs")
+        {
+            // Also check the AST form for cases where P isn't bound (e.g., class body
+            // annotations). In this case, the type might not resolve to a TypeVar.
+            let value_ty = self.expression_type(&attr_expr.value);
+            if let Type::KnownInstance(KnownInstanceType::TypeVar(typevar)) = value_ty
+                && typevar.is_paramspec(self.db())
+            {
+                let name = typevar.name(self.db());
+                let attr_name = &attr_expr.attr;
+                let variadic = if attr_name == "args" {
+                    "*args"
+                } else {
+                    "**kwargs"
+                };
+                if let Some(builder) = self.context.report_lint(&INVALID_PARAMSPEC, annotation) {
+                    builder.into_diagnostic(format_args!(
+                        "`{name}.{attr_name}` is only valid for annotating `{variadic}` function parameters",
+                    ));
+                }
+            }
+        }
 
         let is_pep_613_type_alias = declared.inner_type().is_typealias_special_form();
 
